@@ -25,38 +25,44 @@ void trim_start(char **input) {
     }
 }
 
-void split_redirect(char *input, char **command, char **redirect) {
+void split_at(char *input, char **left, char **right, char c, bool reverse) {
     trim_start(&input);
     trim_end(&input);
     size_t len = strlen(input);
-    char *p = strrchr(input, '>');
+
+    if (len == 0) {
+        *left = NULL;
+        *right = NULL;
+        return;
+    }
+
+    char *p = reverse ? strrchr(input, c) : strchr(input, c);
 
     if (p == NULL) {
-        *command = input;
+        *left = input;
+        *right = NULL;
         return;
     }
     
     if (input == p) {
         // Redirect is at pos 0
 
-        *command = NULL;
-        *redirect = input;
+        *left = NULL;
+        *right = input;
 
         return;
     }
     
     *p = '\0';
     
-    *command = input;
-    trim_end(command);
-    
-    // printf("Found \n\n", p);
+    *left = input;
+    trim_end(left);
 
     if (p + 1 >= input + len) { 
-        *redirect = NULL;
+        *right = NULL;
     } else {
-        *redirect = p + 1;
-        trim_start(redirect);
+        *right = p + 1;
+        trim_start(right);
     }
 }
 
@@ -73,25 +79,71 @@ int split_args(char *line, char **argv, int max_args) {
       return argc;
 }
 
-int main(int argc, char *argv[]) {
-    char buffer[1024];
-    printf("Sup sucka\n");
+void process_command(char *input) {
+    char *command = NULL, *left = NULL, *right = NULL;
 
+    trim_start(&input);
+    trim_end(&input);
+
+    if (strcmp("exit", input) == 0) {
+        exit(EXIT_SUCCESS);
+    }
+
+    char *pipeline[50] = {NULL};
+
+    char *rest = input;
+
+    int pipeline_len = 0;
+
+    // Split pipes first
     while (true) {
-        fprintf(stdout, "> ");
-        fflush(stdout);
+        // Redirect is prioritized over pipe
+        split_at(rest, &left, &right, '|', false);
 
-        if (fgets(buffer, 500, stdin) == NULL) {
+        if (left == NULL && right == NULL) {
             break;
         }
 
-        char *command = NULL, *redirect = NULL;
-        split_redirect(buffer, &command, &redirect);
+        if (left == NULL) {
+            continue;
+        }
+
+        pipeline[pipeline_len] = left;
+        pipeline_len += 1;
+        rest = right;
+        
+        if (right == NULL) {
+            break;
+        }
+    }
+    
+    pid_t pids[50];
+    size_t pid_count = 0;
+
+    int prev_read_end = -1;
+
+    for (size_t i = 0; i < pipeline_len; i += 1) {
+        char *command_part = pipeline[i];
+
+        int fildes[2] = {-1, -1};
+        
+        // If there's a next entry then we need a pipe
+        if (i + 1 < pipeline_len) {
+            if (pipe(fildes) == -1) {
+                perror("Failed to create pipe");
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        // Handle redirects
+        char *redirect = NULL;
+
+        split_at(command_part, &command, &redirect, '>', true);
 
         int redirect_fd = -1;
-        
+
         if (redirect != NULL) {
-            redirect_fd = open(redirect, O_WRONLY | O_CREAT, 0644);
+            redirect_fd = open(redirect, O_CREAT | O_TRUNC | O_WRONLY, 0644);
             
             if (redirect_fd == -1) {
                 perror("Failed to initialize redirect");
@@ -109,42 +161,82 @@ int main(int argc, char *argv[]) {
             }
             
             // Can just continue here since it's a REPL
-            continue;
+            return;
         }
 
+        // Child
         if (pid == 0) {
+            if (command == NULL) {
+                fprintf(stderr, "Can you enter an actual command\n");
+                exit(EXIT_FAILURE);
+            }
+
             char *argv[64];
             int argc = split_args(command, argv, 64);
 
+            // Wire stdout of previous command to stdin of current command
+            if (prev_read_end != -1) {
+                dup2(prev_read_end, STDIN_FILENO);
+            }
+
             if (redirect_fd != -1) {
+                // Redirect stdout to file
                 dup2(redirect_fd, STDOUT_FILENO);
+            } else if (fildes[1] != -1) {
+                // Redirect stdout to pipe for next command
+                dup2(fildes[1], STDOUT_FILENO);
             }
 
-            if (argc == 0) {
-                // No command, user is a $@#$
-
-                fprintf(stderr, "Can you enter an actual command\n");
-                return EXIT_FAILURE;
-            }
-            
             int exec_result = execvp(argv[0], argv);
 
             if (exec_result == -1) {
+                fprintf(stderr, "\n%s\n", argv[0]);
                 perror("Failed to exec");
-                return EXIT_FAILURE;
+                exit(EXIT_FAILURE);
             }
 
             // Do things and then return
-            return 0;
+            exit(EXIT_SUCCESS);
         }
 
-        wait(NULL);
+        // Store pid so we can wait on it later
+        pids[pid_count] = pid;
+        pid_count += 1;
 
-        // Clean up
-
-        if (redirect_fd != -1) {
-            close(redirect_fd);
+        // Close read end of previous pipe if exists, it's not needed anymore cuz we just wired it to the stdin of the current command
+        if (prev_read_end != -1) {
+            close(prev_read_end);
         }
+
+        prev_read_end = fildes[0];
+
+        // Close stdout of current pipe if exists, it's not needed anymore cuz we already wired it
+        if (fildes[1] != -1) {
+            close(fildes[1]);
+        }
+    }
+
+    while (pid_count-- > 0) {
+        if (waitpid(pids[pid_count], NULL, 0) == -1) {
+            // Probably don't care about failed forks here
+            perror("waitpid failed");
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    char buffer[1024];
+    printf("Sup sucka\n");
+
+    while (true) {
+        fprintf(stdout, "> ");
+        fflush(stdout);
+
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            break;
+        }
+
+        process_command(buffer);
 
     }
 
