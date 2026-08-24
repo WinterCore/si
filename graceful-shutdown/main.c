@@ -10,6 +10,8 @@
 #include <signal.h>
 #include <time.h>
 #include <pthread.h>
+#include <errno.h>
+#include <poll.h>
 
 typedef struct WorkerManagerState {
     FILE *lf;
@@ -109,7 +111,7 @@ void fork_runner(int fork_i, int rfd) {
         while (state.job_count >= 8) {
             pthread_cond_wait(&state.not_full, &state.lock);
         }
-        fprintf(stderr, "Fork %d: Pushed job %llu to queue\n", fork_i, job_id);
+        fprintf(stderr, "Fork %d: Pushed job %lu to queue\n", fork_i, job_id);
 
         state.jobs[state.job_count] = job_id;
         state.job_count += 1;
@@ -119,13 +121,20 @@ void fork_runner(int fork_i, int rfd) {
 }
 
 
-bool shutdown = false;
 
+
+int shutdown_fildes[2];
 void handle_shutdown(int sig) {
-    shutdown = true;
+    bool signal = true;
+    int bytes_written = write(shutdown_fildes[1], &signal, 1);
+
+    if (bytes_written < 1) {
+        perror("write shutdown signal");
+    }
 }
 
 void *shutdown_thread_runner(void *arg) {
+    int *shutdown_wpipe = arg;
     struct sigaction sa = {0};
 
     sa.sa_handler = handle_shutdown;
@@ -195,17 +204,41 @@ int main() {
     int process_index = 0;
  
     // Launch shutdown thread
+    int pr = pipe(shutdown_fildes);
 
+    if (pr != 0) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
     pthread_t shutdown_thread_id;
 
-    if (pthread_create(&shutdown_thread_id, NULL, shutdown_thread_runner, NULL) != 0) {
+    if (pthread_create(&shutdown_thread_id, NULL, shutdown_thread_runner, &shutdown_fildes[1]) != 0) {
         perror("pthread_create");
         exit(EXIT_FAILURE);
     }
 
+    // Need to poll on multiple file descriptors in case
+    struct pollfd fds[4]; // 1 shutdown fd, 3 fork pipes
+    
+    fds[0].fd = shutdown_fildes[0]; fds[0].events = POLLIN;
+    fds[1].fd = wpipes[0];          fds[1].events = POLLOUT;
+    fds[2].fd = wpipes[1];          fds[2].events = POLLOUT;
+    fds[3].fd = wpipes[2];          fds[3].events = POLLOUT;
+
     // Dispatch jobs
-    while (!shutdown) {
-        int wfd = wpipes[process_index];        
+    while (true) {
+        int n = poll(fds, 4, -1);
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            // Real error
+            break;
+        }
+
+        int wfd = wpipes[process_index];
         ssize_t pipe_write_result = write(wfd, &job, sizeof(int));
 
         if (pipe_write_result < sizeof(int)) {
