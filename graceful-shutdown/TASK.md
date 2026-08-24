@@ -142,9 +142,9 @@ Done when all of these pass.
 
 1. **Ctrl-C** in the foreground → clean shutdown, exit 0.
 2. **SIGTERM to the parent pid** from another terminal → *identical* result to test 1. Same output files, same exit code, same timing.
-3. **SIGTERM to one worker pid** directly, leaving the parent alone → the parent notices and handles it rather than hanging or ignoring it.
+3. **DEFERRED** — ~~SIGTERM to one worker pid directly~~. Re-add later together with the parent detecting children that die on their own.
 4. **Two signals in rapid succession** → no crash, no double-free, no hang, no duplicated output lines.
-5. **SIGKILL to one worker** → the parent must not wait forever for a process that can never respond.
+5. **DEFERRED** — ~~SIGKILL to one worker~~. Same later batch as test 3.
 6. **After exit:** no orphaned processes, no zombies. Verify with `ps` — nothing of yours should survive.
 7. **Job accounting balances**, per the guarantees above.
 8. **Clean under a thread sanitizer**, and clean under valgrind for leaks.

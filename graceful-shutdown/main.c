@@ -7,7 +7,9 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <time.h>
+#include <pthread.h>
 
 typedef struct WorkerManagerState {
     FILE *lf;
@@ -91,7 +93,7 @@ void fork_runner(int fork_i, int rfd) {
  
     while (true) {
         uint64_t job_id;
-        ssize_t bytes_read = read(rfd, &job_id, 4);
+        ssize_t bytes_read = read(rfd, &job_id, sizeof(uint64_t));
 
         if (bytes_read == -1) {
             perror("read");
@@ -116,24 +118,66 @@ void fork_runner(int fork_i, int rfd) {
     }
 }
 
+
+bool shutdown = false;
+
+void handle_shutdown(int sig) {
+    shutdown = true;
+}
+
+void *shutdown_thread_runner(void *arg) {
+    struct sigaction sa = {0};
+
+    sa.sa_handler = handle_shutdown;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    
+    return NULL;
+}
+
 int main() {
     pid_t pids[3] = {};
-    int pipes[6] = {};
+    int wpipes[3] = {};
+    int fildes[2] = {};
+
+    // Block
+    sigset_t set;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
 
     for (int i = 0; i < 3; i += 1) {
-        int pr = pipe(&pipes[i * 2]);
+        int pr = pipe(fildes);
+
+        if (pr != 0) {
+            perror("pipe");
+            exit(EXIT_FAILURE);
+        }
+
+        wpipes[i] = fildes[1];
 
         pid_t pid = fork();
         pids[i] = pid;
 
-
         if (pid == 0) {
-            fork_runner(i, pipes[i * 2]);
+            // Child
+            fork_runner(i, fildes[0]);
+
+            // Close write end since it's only needed on the parent
+            close(fildes[1]);
             return 0;
         } else if (pid > 0) {
+            // Close read end since it's only needed on the child
+            close(fildes[0]);
             printf("parent\n");
         } else {
             perror("fork");
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -149,10 +193,19 @@ int main() {
 
     int job = 0;
     int process_index = 0;
+ 
+    // Launch shutdown thread
+
+    pthread_t shutdown_thread_id;
+
+    if (pthread_create(&shutdown_thread_id, NULL, shutdown_thread_runner, NULL) != 0) {
+        perror("pthread_create");
+        exit(EXIT_FAILURE);
+    }
 
     // Dispatch jobs
-    while (true) {
-        int wfd = pipes[process_index * 2 + 1];        
+    while (!shutdown) {
+        int wfd = wpipes[process_index];        
         ssize_t pipe_write_result = write(wfd, &job, sizeof(int));
 
         if (pipe_write_result < sizeof(int)) {
@@ -177,12 +230,19 @@ int main() {
             process_index = 0;
         }
     }
+    
+    // Shutdown was initiatied
 
+    // Clean up pipes
+    for (int i = 0; i < 3; i += 1) {
+        close(wpipes[i]);
+    }
+
+    // Wait for forks to terminate
     for (size_t i = 0; i < 3; i += 1) {
         pid_t pid = wait(NULL);
         printf("fork %d terminated\n", pid);
     }
     
-
     return 0;
 }
