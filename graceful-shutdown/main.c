@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -12,6 +14,22 @@
 #include <pthread.h>
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>
+
+#define JOB_GENERATION_INTERVAL 100
+#define NUM_FORKS 3
+#define NUM_WORKERS 5
+// 1 shutdown fd + one write pipe per fork
+#define NUM_POLL_FDS (NUM_FORKS + 1)
+
+// TODO: Dead fork detection & dead worker detection
+// TODO: 10 second shutdown timeout
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 typedef struct WorkerManagerState {
     FILE *lf;
@@ -35,6 +53,14 @@ void *thread_worker(void *arg) {
         }
 
         int job = state->jobs[0];
+        // Shutdown signal
+        if (job == -1) {
+            // Do not consume signal so that it can be used by other workers
+            // unlock and exit
+            pthread_mutex_unlock(&state->lock);
+            return NULL;
+        }
+
         state->job_count -= 1;
         if (state->job_count > 0) {
             memmove(state->jobs, state->jobs + 1, state->job_count * sizeof(int));
@@ -87,22 +113,26 @@ void fork_runner(int fork_i, int rfd) {
         .not_full = PTHREAD_COND_INITIALIZER,
     };
 
-    pthread_t worker_threads[4] = {};
+    pthread_t worker_threads[NUM_WORKERS] = {};
 
-    for (int i = 0; i < 4; i += 1) {
+    // Launch worker threads
+    for (int i = 0; i < NUM_WORKERS; i += 1) {
         pthread_create(&worker_threads[i], NULL, thread_worker, &state);
     }
  
     while (true) {
-        uint64_t job_id;
-        ssize_t bytes_read = read(rfd, &job_id, sizeof(uint64_t));
+        int64_t job_id;
+        ssize_t bytes_read = read(rfd, &job_id, sizeof(int64_t));
 
         if (bytes_read == -1) {
             perror("read");
+            exit(EXIT_FAILURE);
         }
 
+        // Shutdown signal EOF
         if (bytes_read == 0) {
-            exit(EXIT_SUCCESS);
+            fprintf(stderr, "Killing fork %d\n", fork_i);
+            job_id = -1;
         }
         
         pthread_mutex_lock(&state.lock);
@@ -111,17 +141,30 @@ void fork_runner(int fork_i, int rfd) {
         while (state.job_count >= 8) {
             pthread_cond_wait(&state.not_full, &state.lock);
         }
-        fprintf(stderr, "Fork %d: Pushed job %lu to queue\n", fork_i, job_id);
+        
+        if (job_id == -1) {
+            fprintf(stderr, "Fork %d: Pushed kill pill to queue\n", fork_i);
+        } else {
+            fprintf(stderr, "Fork %d: Pushed job %ld to queue\n", fork_i, job_id);
+        }
 
         state.jobs[state.job_count] = job_id;
         state.job_count += 1;
         pthread_cond_signal(&state.not_empty);
         pthread_mutex_unlock(&state.lock);
+
+        if (job_id == -1) {
+            break;
+        }
     }
+
+    for (int i = 0; i < NUM_WORKERS; i += 1) {
+        pthread_join(worker_threads[i], NULL);
+        fprintf(stderr, "Fork %d: Worker %d exited!\n", fork_i, i);
+    }
+
+    exit(EXIT_SUCCESS);
 }
-
-
-
 
 int shutdown_fildes[2];
 void handle_shutdown(int sig) {
@@ -147,9 +190,10 @@ void *shutdown_thread_runner(void *arg) {
 }
 
 int main() {
-    pid_t pids[3] = {};
-    int wpipes[3] = {};
+    pid_t pids[NUM_FORKS] = {};
+    int wpipes[NUM_FORKS] = {};
     int fildes[2] = {};
+
 
     // Block
     sigset_t set;
@@ -160,7 +204,7 @@ int main() {
 
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 
-    for (int i = 0; i < 3; i += 1) {
+    for (int i = 0; i < NUM_FORKS; i += 1) {
         int pr = pipe(fildes);
 
         if (pr != 0) {
@@ -174,11 +218,12 @@ int main() {
         pids[i] = pid;
 
         if (pid == 0) {
+            // Close write end since it's only needed on the parent
+            for (int j = 0; j <= i; j += 1) close(wpipes[j]);
+
             // Child
             fork_runner(i, fildes[0]);
 
-            // Close write end since it's only needed on the parent
-            close(fildes[1]);
             return 0;
         } else if (pid > 0) {
             // Close read end since it's only needed on the child
@@ -190,8 +235,6 @@ int main() {
         }
     }
 
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000000 };
-
     FILE *df = fopen("dispatch.log", "w");
     if (df == NULL) {
         perror("fopen");
@@ -200,8 +243,8 @@ int main() {
 
     char buffer[1024];
 
-    int job = 0;
-    int process_index = 0;
+    int64_t job = 0;
+    int turn = 0;
  
     // Launch shutdown thread
     int pr = pipe(shutdown_fildes);
@@ -218,16 +261,31 @@ int main() {
     }
 
     // Need to poll on multiple file descriptors in case
-    struct pollfd fds[4]; // 1 shutdown fd, 3 fork pipes
-    
+    struct pollfd fds[NUM_POLL_FDS];
+
     fds[0].fd = shutdown_fildes[0]; fds[0].events = POLLIN;
-    fds[1].fd = wpipes[0];          fds[1].events = POLLOUT;
-    fds[2].fd = wpipes[1];          fds[2].events = POLLOUT;
-    fds[3].fd = wpipes[2];          fds[3].events = POLLOUT;
+    for (int i = 0; i < NUM_FORKS; i += 1) {
+        fds[i + 1].fd = wpipes[i];
+        fds[i + 1].events = POLLOUT;
+    }
+
+    int64_t deadline = now_ms() + JOB_GENERATION_INTERVAL;
+    int64_t wait_remaining = JOB_GENERATION_INTERVAL;
+
+    int64_t start = now_ms();
 
     // Dispatch jobs
     while (true) {
-        int n = poll(fds, 4, -1);
+        int n = poll(fds, NUM_POLL_FDS, wait_remaining < 0 ? -1 : wait_remaining);
+        int64_t now = now_ms();
+
+        wait_remaining = deadline - now;
+ 
+        if (wait_remaining < 0) {
+            for (int i = 1; i < NUM_POLL_FDS; i += 1) {
+                fds[i].events = POLLOUT;
+            }
+        }
 
         if (n < 0) {
             if (errno == EINTR) {
@@ -238,15 +296,39 @@ int main() {
             break;
         }
 
-        int wfd = wpipes[process_index];
-        ssize_t pipe_write_result = write(wfd, &job, sizeof(int));
+        if (n == 0) {
+            continue;
+        }
 
-        if (pipe_write_result < sizeof(int)) {
+        // Check shutdown signal first
+        if (fds[0].revents & POLLIN) {
+            // Shutdown signal received
+            break;
+        }
+
+        int wfd = -1;
+        int process = -1;
+
+        // Pick the first pipe that has space but prioritize turns
+        for (int i = 0; i < NUM_FORKS; i += 1) {
+            int fork_idx = (turn + i) % NUM_FORKS;
+            if (fds[fork_idx + 1].revents & POLLOUT) {
+                wfd = fds[fork_idx + 1].fd;
+                process = fork_idx;
+                break;
+            }
+        }
+
+        // printf("Wfd: %d\npoll: %d\nwait_remaining: %ld\n", wfd, n, wait_remaining);
+
+        size_t pipe_write_result = write(wfd, &job, sizeof(int64_t));
+
+        if (pipe_write_result < sizeof(int64_t)) {
             fprintf(stderr, "Failed to send job through pipe!\n");
             exit(EXIT_FAILURE);
         }
 
-        int bytes_written = snprintf(buffer, sizeof(buffer), "Dispatched job %d to process %d\n", job, process_index);
+        int bytes_written = snprintf(buffer, sizeof(buffer), "Dispatched job %lu to process %d\n", job, process);
         int result = fwrite(buffer, 1, bytes_written, df);
         if (result < bytes_written) {
             perror("fwrite");
@@ -255,26 +337,43 @@ int main() {
         buffer[bytes_written] = '\0';
         fprintf(stderr, "%s", buffer);
         fflush(df);
-        nanosleep(&ts, NULL);
 
         job += 1;
-        process_index += 1;
-        if (process_index >= 3) {
-            process_index = 0;
+        turn += 1;
+        if (turn >= NUM_FORKS) {
+            turn = 0;
+        }
+
+        deadline = deadline + JOB_GENERATION_INTERVAL;
+        wait_remaining = deadline - now_ms();
+        
+        if (start + 3000 < now_ms()) {
+            break;
+        }
+
+        if (wait_remaining < 0) {
+            continue;
+        }
+
+        // Remove listeners for all fork fds
+        for (int i = 1; i < NUM_POLL_FDS; i += 1) {
+            fds[i].events = 0;
         }
     }
     
     // Shutdown was initiatied
 
+    fprintf(stderr, "Shutting down...\n");
+
     // Clean up pipes
-    for (int i = 0; i < 3; i += 1) {
+    for (int i = 0; i < NUM_FORKS; i += 1) {
         close(wpipes[i]);
     }
 
     // Wait for forks to terminate
-    for (size_t i = 0; i < 3; i += 1) {
+    for (size_t i = 0; i < NUM_FORKS; i += 1) {
         pid_t pid = wait(NULL);
-        printf("fork %d terminated\n", pid);
+        printf("Fork %zu terminated\n", i);
     }
     
     return 0;
