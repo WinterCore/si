@@ -131,7 +131,7 @@ void fork_runner(int fork_i, int rfd) {
 
         // Shutdown signal EOF
         if (bytes_read == 0) {
-            fprintf(stderr, "Killing fork %d\n", fork_i);
+            fprintf(stderr, "Shutting down fork %d\n", fork_i);
             job_id = -1;
         }
         
@@ -150,12 +150,14 @@ void fork_runner(int fork_i, int rfd) {
 
         state.jobs[state.job_count] = job_id;
         state.job_count += 1;
-        pthread_cond_signal(&state.not_empty);
-        pthread_mutex_unlock(&state.lock);
-
         if (job_id == -1) {
+            pthread_cond_broadcast(&state.not_empty);
+            pthread_mutex_unlock(&state.lock);
             break;
         }
+
+        pthread_cond_signal(&state.not_empty);
+        pthread_mutex_unlock(&state.lock);
     }
 
     for (int i = 0; i < NUM_WORKERS; i += 1) {
@@ -166,33 +168,62 @@ void fork_runner(int fork_i, int rfd) {
     exit(EXIT_SUCCESS);
 }
 
-int shutdown_fildes[2];
-void handle_shutdown(int sig) {
-    bool signal = true;
-    int bytes_written = write(shutdown_fildes[1], &signal, 1);
-
-    if (bytes_written < 1) {
-        perror("write shutdown signal");
-    }
-}
+pid_t pids[NUM_FORKS] = {};
 
 void *shutdown_thread_runner(void *arg) {
     int *shutdown_wpipe = arg;
-    struct sigaction sa = {0};
+    sigset_t set;
+    int sig;
 
-    sa.sa_handler = handle_shutdown;
-    sigemptyset(&sa.sa_mask);
+    // 1. Build the set containing both signals
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
 
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    
+    // 2. Block both signals process-wide (or for this thread)
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    printf("Waiting for SIGINT or SIGTERM...\n");
+
+    int n = 0;
+
+    while (true) {
+        // 3. Wait synchronously for whichever arrives first
+        sigwait(&set, &sig);
+
+        n += 1;
+
+        // First term signal is graceful shutdown 
+        if (n == 1) {
+            bool signal = true;
+            int bytes_written = write(*shutdown_wpipe, &signal, 1);
+
+            if (bytes_written < 1) {
+                perror("write shutdown signal");
+            }
+        }
+
+        // Second term signal is kill everything with fire
+        if (n == 2) {
+            for (int i = 0; i < NUM_FORKS; i += 1) {
+                if (kill(pids[i], SIGKILL) == -1) {
+                    perror("kill failed");
+                } else {
+                    fprintf(stderr, "Killed fork %d and all of its workers!\n", i);
+                }
+            }
+
+            break;
+        }
+    }
+        
     return NULL;
 }
 
 int main() {
-    pid_t pids[NUM_FORKS] = {};
     int wpipes[NUM_FORKS] = {};
     int fildes[2] = {};
+    int shutdown_fildes[2];
 
 
     // Block
@@ -321,9 +352,9 @@ int main() {
 
         // printf("Wfd: %d\npoll: %d\nwait_remaining: %ld\n", wfd, n, wait_remaining);
 
-        size_t pipe_write_result = write(wfd, &job, sizeof(int64_t));
+        ssize_t pipe_write_result = write(wfd, &job, sizeof(int64_t));
 
-        if (pipe_write_result < sizeof(int64_t)) {
+        if (pipe_write_result < (ssize_t) sizeof(int64_t)) {
             fprintf(stderr, "Failed to send job through pipe!\n");
             exit(EXIT_FAILURE);
         }
@@ -347,9 +378,11 @@ int main() {
         deadline = deadline + JOB_GENERATION_INTERVAL;
         wait_remaining = deadline - now_ms();
         
+        /*
         if (start + 3000 < now_ms()) {
             break;
         }
+        */
 
         if (wait_remaining < 0) {
             continue;
