@@ -225,6 +225,7 @@ int main() {
     int fildes[2] = {};
     int shutdown_fildes[2];
 
+    signal(SIGPIPE, SIG_IGN);
 
     // Block
     sigset_t set;
@@ -314,7 +315,9 @@ int main() {
  
         if (wait_remaining < 0) {
             for (int i = 1; i < NUM_POLL_FDS; i += 1) {
-                fds[i].events = POLLOUT;
+                if (fds[i].fd != -1) {
+                    fds[i].events = POLLOUT;
+                }
             }
         }
 
@@ -340,9 +343,23 @@ int main() {
         int wfd = -1;
         int process = -1;
 
+        for (int i = 1; i < NUM_POLL_FDS; i += 1) {
+            // Dead forks detection
+            if (fds[i].revents & POLLHUP || fds[i].revents & POLLERR) {
+                fprintf(stderr, "Fork %d has died unexpectedly!", i);
+                fds[i].fd = -1;
+                fds[i].events = 0;
+            }
+        }
+
         // Pick the first pipe that has space but prioritize turns
         for (int i = 0; i < NUM_FORKS; i += 1) {
             int fork_idx = (turn + i) % NUM_FORKS;
+
+            if (fds[fork_idx + 1].fd == -1) {
+                continue;
+            }
+
             if (fds[fork_idx + 1].revents & POLLOUT) {
                 wfd = fds[fork_idx + 1].fd;
                 process = fork_idx;
@@ -350,12 +367,28 @@ int main() {
             }
         }
 
+        if (wfd == -1) {
+            continue;
+        }
+
         // printf("Wfd: %d\npoll: %d\nwait_remaining: %ld\n", wfd, n, wait_remaining);
 
-        ssize_t pipe_write_result = write(wfd, &job, sizeof(int64_t));
+        ssize_t pipe_bytes_written = write(wfd, &job, sizeof(int64_t));
 
-        if (pipe_write_result < (ssize_t) sizeof(int64_t)) {
-            fprintf(stderr, "Failed to send job through pipe!\n");
+        if (pipe_bytes_written < 0) {
+            if (errno == EPIPE) {
+                for (int i = 1; i < NUM_POLL_FDS; i += 1) {
+                    if (fds[i].fd == wfd) {
+                        fds[i].fd = -1;
+                        fds[i].events = 0;
+                        printf("Fork %d has died unexpectedly!", i);
+                    }
+                }
+                
+                continue;
+            }
+
+            perror("Failed to send job through pipe");
             exit(EXIT_FAILURE);
         }
 
@@ -390,7 +423,9 @@ int main() {
 
         // Remove listeners for all fork fds
         for (int i = 1; i < NUM_POLL_FDS; i += 1) {
-            fds[i].events = 0;
+            if (fds[i].fd != -1) {
+                fds[i].events = 0;
+            }
         }
     }
     
