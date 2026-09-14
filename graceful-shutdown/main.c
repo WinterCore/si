@@ -16,7 +16,7 @@
 #include <poll.h>
 #include <fcntl.h>
 
-#define JOB_GENERATION_INTERVAL 100
+#define JOB_GENERATION_INTERVAL 300
 #define NUM_FORKS 3
 #define NUM_WORKERS 5
 // 1 shutdown fd + one write pipe per fork
@@ -34,7 +34,7 @@ static int64_t now_ms(void) {
 typedef struct WorkerManagerState {
     FILE *lf;
     int fork_i;
-    int jobs[8];
+    int64_t jobs[8];
     int job_count;
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
@@ -52,7 +52,7 @@ void *thread_worker(void *arg) {
             pthread_cond_wait(&state->not_empty, &state->lock);
         }
 
-        int job = state->jobs[0];
+        int64_t job = state->jobs[0];
         // Shutdown signal
         if (job == -1) {
             // Do not consume signal so that it can be used by other workers
@@ -63,7 +63,7 @@ void *thread_worker(void *arg) {
 
         state->job_count -= 1;
         if (state->job_count > 0) {
-            memmove(state->jobs, state->jobs + 1, state->job_count * sizeof(int));
+            memmove(state->jobs, state->jobs + 1, state->job_count * sizeof(int64_t));
         }
 
         pthread_cond_signal(&state->not_full);
@@ -74,7 +74,7 @@ void *thread_worker(void *arg) {
         
         char buffer[1024];
         // Done processing job
-        int bytes_written = snprintf(buffer, sizeof(buffer), "Fork %d: Finished processing job %d\n", state->fork_i, job);
+        int bytes_written = snprintf(buffer, sizeof(buffer), "Fork %d: Finished processing job %lld\n", state->fork_i, job);
         // Dispatch job
         int result = fwrite(buffer, 1, bytes_written, state->lf);
         if (result < bytes_written) {
@@ -145,7 +145,7 @@ void fork_runner(int fork_i, int rfd) {
         if (job_id == -1) {
             fprintf(stderr, "Fork %d: Pushed kill pill to queue\n", fork_i);
         } else {
-            fprintf(stderr, "Fork %d: Pushed job %ld to queue\n", fork_i, job_id);
+            fprintf(stderr, "Fork %d: Pushed job %lld to queue\n", fork_i, job_id);
         }
 
         state.jobs[state.job_count] = job_id;
@@ -278,10 +278,7 @@ int main() {
     int64_t job = 0;
     int turn = 0;
  
-    // Launch shutdown thread
-    int pr = pipe(shutdown_fildes);
-
-    if (pr != 0) {
+    if (pipe(shutdown_fildes) != 0) {
         perror("pipe");
         exit(EXIT_FAILURE);
     }
