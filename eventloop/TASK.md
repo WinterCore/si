@@ -30,13 +30,13 @@ cc -std=c11 -Wall -Wextra -Werror evloop.c -pthread -o evloop
 
 main thread — the loop
   poll() over:
-    stdin      → job lines come in
+    stdin      → job characters come in
     signalfd   → SIGINT, SIGTERM
     eventfd    → "a worker finished something"
 
 2 worker threads — created once at startup, never created again
-  pop a job, sleep 2–4 seconds (that's the work), append a line to
-  completions.log, then write to the eventfd
+  pop a job, sleep 2–4 seconds (that's the work), write a line to
+  stderr, then write to the eventfd
 ```
 
 Three threads, one process. The workers may block on the queue's mutex and
@@ -46,14 +46,14 @@ condvar. The main thread may not — see the constraint below.
 
 ## What each part does
 
-**The loop** reads lines off stdin, assigns ids 1, 2, 3… in acceptance
+**The loop** reads characters off stdin, assigns ids 1, 2, 3… in acceptance
 order, pushes jobs onto the queue, and keeps count of everything. When the
 eventfd fires it collects finished jobs for accounting. When the signalfd
 fires it starts shutdown. When stdin ends it starts a gentler shutdown.
 That is the entire main thread.
 
 **A worker** is a body you have already written once in your supervisor:
-wait for a job, sleep, write the line to disk, signal completion. The only
+wait for a job, sleep, write the line to stderr, signal completion. The only
 new sentence is *how* it signals completion — an `eventfd` write, because
 the thing waiting on the other end is blocked in `poll()`, and a condvar
 broadcast cannot reach a thread that is not waiting on a condvar.
@@ -62,8 +62,8 @@ broadcast cannot reach a thread that is not waiting on a condvar.
 
 ## Protocol and queue
 
-Every stdin line is one job, whatever the text says. There is no quit
-command; input ends by EOF or by signal, never by a keyword.
+Every stdin character is one job — `'a'`, `'7'`, `'\n'`, all of them. There
+is no quit command; input ends by EOF or by signal, never by a keyword.
 
 The queue is shared memory between the loop and the 2 workers: an array of
 capacity **4**, a mutex, a condvar. Bounded on purpose, small on purpose.
@@ -87,11 +87,12 @@ Two rules, and they are the exercise:
 
 ## Output and accounting
 
-- `completions.log` — one line per finished job, written after the sleep,
-  on disk before the process exits. The file is evidence; buffering it
-  into oblivion is failing the test quietly instead of loudly.
+- stderr — one line per finished job, written after the sleep, e.g.
+  `done 3 'x'`. stderr is unbuffered: every line lands the moment it is
+  written, so there is nothing to flush and nothing to lose.
 - At exit, print one line to stderr: `accepted A, completed C, discarded D`,
-  and `A = C + D` must hold. Completed jobs finished and reached disk.
+  and `A = C + D` must hold. Completed jobs finished and were written
+  out.
   Discarded jobs were accepted but queued-and-never-started at shutdown.
 
 ---
@@ -102,8 +103,8 @@ Two rules, and they are the exercise:
    everything still queued, runs to completion. Then exit 0.
 2. **SIGINT or SIGTERM** (read off the signalfd, in the same poll set) —
    stop reading input immediately. Jobs already started run to completion
-   and reach disk. Queued-but-unstarted jobs are discarded and counted.
-   Exit 0.
+   and are written out. Queued-but-unstarted jobs are discarded and
+   counted. Exit 0.
 3. **A second signal during the drain** — exit immediately with status 1.
    In-flight lines may be absent on this path; that is accepted here.
 4. During any drain the loop stays blocked in `poll()` — still watching
@@ -131,12 +132,13 @@ code care about the difference and which don't.
 ## Acceptance tests
 
 1. Idle, press Ctrl-C → exit 0, `accepted 0, completed 0, discarded 0`.
-2. `printf 'a\nb\nc\n' | ./evloop` → EOF path: 3 lines in
-   completions.log, exit 0.
+2. `printf 'a\nb\nc\n' | ./evloop` → EOF path: 6 `done` lines on
+   stderr (every character, `\n` included), exit 0.
 3. SIGTERM from another terminal while jobs are mid-flight → started jobs
-   still complete and reach disk, accounting balances, exit 0.
-4. Blast 1000 lines into a pipe instantly, signal mid-backlog → queue was
-   full, stdin was ignored, pipe backed up; accounting still balances.
+   still complete and appear on stderr, accounting balances, exit 0.
+4. Blast 1000 characters into a pipe instantly, signal mid-backlog →
+   queue was full, stdin was ignored, pipe backed up; accounting still
+   balances.
 5. Second signal during drain → immediate exit 1.
 6. While idle: `strace -p <pid>` → the process is sitting in
    `poll`/`ppoll` and doing nothing else. If you see a syscall loop, you
