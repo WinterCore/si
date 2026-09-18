@@ -125,7 +125,7 @@ int main() {
     char buffer[1024] = {0};
     size_t job = 0;
 
-    bool shutdown_initiated = false;
+    bool shutdown_state = false;
     size_t pushed_jobs = 0;
 
     while (true) {
@@ -204,20 +204,34 @@ int main() {
             fprintf(stderr, "Workers finished %zu jobs\n", jobs_finished);
 
             
-            if (! shutdown_initiated) {
+            if (! shutdown_state) {
                 pollfds[0].events = POLLIN;
             }
 
-            if (pushed_jobs - jobs_finished_total == 0) {
+            if (shutdown_state && pushed_jobs - jobs_finished_total == 0) {
                 break;
             }
         }
 
-        if ((pollfds[2].revents & POLLIN) && ! shutdown_initiated) {
+        if ((pollfds[2].revents & POLLIN)) {
+            // Shutdown sequence was already started, force shutdown
+            if (shutdown_state) {
+                
+                fprintf(stderr, "Forced shutdown...\n\tFinished jobs: %zu\n\tQueued & In-progress jobs killed: %zu\n", jobs_finished_total, pushed_jobs - jobs_finished_total);
+            
+                exit(EXIT_FAILURE);
+            }
+
+            struct signalfd_siginfo si;
+            read(pollfds[2].fd, &si, sizeof(si));
+            // TODO: Add error handling
+
+            
 shutdown:
             // Shutdown was initiated
-            shutdown_initiated = true;
+            shutdown_state = true;
             pollfds[0].events = 0;
+            pollfds[0].fd = -1;
 
             fprintf(stderr, "---------------------------------\n");
             fprintf(stderr, "Shutdown initiated...\n\tRemaining jobs in queue: %zu\n", pushed_jobs - jobs_finished_total);
@@ -268,7 +282,7 @@ shutdown:
         }
     }
 
-    printf("Summary:\n\tFinished jobs: %zu\n\tUnfinished jobs: %zu", jobs_finished_total, jobs_unfinished_total);
+    fprintf(stderr, "Summary:\n\tFinished jobs: %zu\n\tUnfinished jobs: %zu", jobs_finished_total, jobs_unfinished_total);
 
     return 0;
 }
