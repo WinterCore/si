@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <string.h>
+#include <termios.h>
 
 #define WORKER_COUNT 2
 #define JOB_QUEUE_CAPACITY 4
@@ -67,6 +68,13 @@ void *worker_runner(void *arg) {
 }
 
 int main() {
+    // Disable automatic flushing when sending SIGINT with ctrl+c 
+    // in the terminal driver. Took me a while to figure this shit out
+    struct termios t;
+    tcgetattr(STDIN_FILENO, &t);
+    t.c_lflag |= NOFLSH;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+
     pthread_t workers[WORKER_COUNT] = {};
 
     sigset_t mask;
@@ -118,7 +126,7 @@ int main() {
     size_t job = 0;
 
     bool shutdown_initiated = false;
-    size_t post_shutdown_jobs_remaining = 0;
+    size_t pushed_jobs = 0;
 
     while (true) {
         int n = poll(pollfds, sizeof(pollfds) / sizeof(pollfds[0]), -1);
@@ -147,11 +155,14 @@ int main() {
             int n = read(pollfds[0].fd, buffer, queue_space_remaining);
 
             if (n == 0) {
+                pthread_mutex_unlock(&sws.jobs_mutex);
                 // EOF received: perform graceful shutdown
                 goto shutdown;
             }
 
             if (n < 0) {
+                pthread_mutex_unlock(&sws.jobs_mutex);
+
                 // No data available
                 if (errno == EAGAIN) {
                     continue;
@@ -169,9 +180,10 @@ int main() {
             }
             
             fprintf(stderr, "Pushed %d jobs to the queue...\n", n);
-            pthread_cond_broadcast(&sws.cond_has_jobs);
-
+            pushed_jobs += n;
             pthread_mutex_unlock(&sws.jobs_mutex);
+
+            pthread_cond_broadcast(&sws.cond_has_jobs);
         }
         
         // Workers reporting finished jobs
@@ -190,17 +202,14 @@ int main() {
 
             jobs_finished_total += jobs_finished;
             fprintf(stderr, "Workers finished %zu jobs\n", jobs_finished);
+
             
             if (! shutdown_initiated) {
                 pollfds[0].events = POLLIN;
             }
 
-            if (shutdown_initiated) {
-                post_shutdown_jobs_remaining -= jobs_finished;
-
-                if (post_shutdown_jobs_remaining <= 0) {
-                    break;
-                }
+            if (pushed_jobs - jobs_finished_total == 0) {
+                break;
             }
         }
 
@@ -209,12 +218,9 @@ shutdown:
             // Shutdown was initiated
             shutdown_initiated = true;
             pollfds[0].events = 0;
-            fprintf(stderr, "---------------------------------\n");
-            fprintf(stderr, "Shutdown initiated...\n\tRemaining jobs in queue: %zu\n", post_shutdown_jobs_remaining);
 
-            pthread_mutex_lock(&sws.jobs_mutex);
-            post_shutdown_jobs_remaining = sws.job_count;
-            pthread_mutex_unlock(&sws.jobs_mutex);
+            fprintf(stderr, "---------------------------------\n");
+            fprintf(stderr, "Shutdown initiated...\n\tRemaining jobs in queue: %zu\n", pushed_jobs - jobs_finished_total);
 
             // Drain stdin and close it
             while (true) {
@@ -243,7 +249,7 @@ shutdown:
             close(STDIN_FILENO);
 
             // No jobs in queue then we can safely break
-            if (post_shutdown_jobs_remaining == 0) {
+            if (pushed_jobs - jobs_finished_total == 0) {
                 break;
             }
         }
