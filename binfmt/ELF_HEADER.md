@@ -1,168 +1,70 @@
-# The ELF header
+# ELF Header (Elf64_Ehdr)
 
-Specs: [gABI](https://gabi.xinuos.com/v42/index.html) · [elf(5)](https://man7.org/linux/man-pages/man5/elf.5.html)
+The first 64 bytes of every 64-bit ELF file. Everything else in the file is
+located by offsets stored *here* — the header is the root of the format.
+Defined in `<elf.h>`; the on-disk layout is fixed, no padding.
 
-The ELF header sits at offset 0 of every ELF file. It is a small fixed-size
-table that says what the file is and where everything else in it lives.
+```
+offset  size  field         what it is
+------  ----  ------------  ------------------------------------------
+0x00    16    e_ident[16]   magic + class + endianness + OSABI (see below)
+0x10     2    e_type        file type: ET_EXEC=2, ET_DYN=3, ET_CORE=4
+                            (PIE executables are ET_DYN — same as .so!)
+0x12     2    e_machine     ISA: EM_AARCH64=183 (0xB7), EM_X86_64=62
+0x14     4    e_version     must be 1 (EV_CURRENT)
+0x18     8    e_entry       virtual address of the entry point
 
-There are only two layouts, `Elf32_Ehdr` (52 bytes) and `Elf64_Ehdr`
-(64 bytes). Both have the same fields in the same order.
+0x20     8    e_phoff       file offset of the program header table
+0x28     8    e_shoff       file offset of the section header table
+0x30     4    e_flags       arch-specific flags (usually 0)
+0x34     2    e_ehsize      size of this header (64)
+0x36     2    e_phentsize   size of one program header entry (56)
+0x38     2    e_phnum       number of program header entries
+0x3a     2    e_shentsize   size of one section header entry (64)
+0x3c     2    e_shnum       number of section header entries
+0x3e     2    e_shstrndx    section index of the section-name string table
+```
 
----
+## e_ident[16]
 
-## Part 1: `e_ident`, the first 16 bytes (`EI_NIDENT`)
+Parsed before anything else — it tells you how to even read the rest.
 
-Plain single bytes, so they read the same on every machine. You read these
-**before** you know anything else about the file, and they tell you how to
-read the rest.
-
-| Byte | Index name      | Values                                                                 |
-|------|-----------------|------------------------------------------------------------------------|
-| 0–3  | `EI_MAG0..3`    | `7f 45 4c 46` (`\x7f E L F`)                                           |
-| 4    | `EI_CLASS`      | `ELFCLASS32` = 1, `ELFCLASS64` = 2                                     |
-| 5    | `EI_DATA`       | `ELFDATA2LSB` = 1 (little-endian), `ELFDATA2MSB` = 2 (big-endian)      |
-| 6    | `EI_VERSION`    | `EV_CURRENT` = 1                                                       |
-| 7    | `EI_OSABI`      | `ELFOSABI_SYSV` = 0, `ELFOSABI_GNU`/`ELFOSABI_LINUX` = 3, `ELFOSABI_FREEBSD` = 9, … |
-| 8    | `EI_ABIVERSION` | usually 0                                                              |
-| 9–15 | `EI_PAD`        | zeros, ignore                                                          |
-
----
-
-## Part 2: the rest of the header
-
-From byte 16 on, every multi-byte field is in the byte order `EI_DATA` set.
-
-Type sizes:
-
-| Type   | Elf32 | Elf64 |
-|--------|-------|-------|
-| `Half` | 2     | 2     |
-| `Word` | 4     | 4     |
-| `Addr` | 4     | **8** |
-| `Off`  | 4     | **8** |
-
-| Field         | Type   | Offset 32 / 64 | Meaning                                                        |
-|---------------|--------|----------------|----------------------------------------------------------------|
-| `e_type`      | `Half` | 16 / 16        | file kind (see below)                                          |
-| `e_machine`   | `Half` | 18 / 18        | CPU (see below)                                                |
-| `e_version`   | `Word` | 20 / 20        | `EV_CURRENT` = 1                                               |
-| `e_entry`     | `Addr` | 24 / 24        | **virtual address** where execution starts, 0 if none         |
-| `e_phoff`     | `Off`  | 28 / 32        | file offset of the program header table, 0 if none            |
-| `e_shoff`     | `Off`  | 32 / 40        | file offset of the section header table, 0 if none            |
-| `e_flags`     | `Word` | 36 / 48        | CPU-specific flags                                             |
-| `e_ehsize`    | `Half` | 40 / 52        | size of this header: 52 / 64                                   |
-| `e_phentsize` | `Half` | 42 / 54        | size of one program header: 32 / 56                           |
-| `e_phnum`     | `Half` | 44 / 56        | number of program headers                                      |
-| `e_shentsize` | `Half` | 46 / 58        | size of one section header: 40 / 64                            |
-| `e_shnum`     | `Half` | 48 / 60        | number of section headers                                      |
-| `e_shstrndx`  | `Half` | 50 / 62        | index of the section that holds section *names*               |
-| (end)         |        | 52 / 64        |                                                                |
-
-### `e_type`
-
-| Name       | Value         | What                                                  |
-|------------|---------------|-------------------------------------------------------|
-| `ET_NONE`  | 0             | no type                                               |
-| `ET_REL`   | 1             | relocatable object (`.o`)                             |
-| `ET_EXEC`  | 2             | executable at a fixed address (`-no-pie`)             |
-| `ET_DYN`   | 3             | shared object: a `.so` **or** a PIE executable        |
-| `ET_CORE`  | 4             | core dump                                             |
-| OS range   | 0xfe00–0xfeff | `ET_LOOS`..`ET_HIOS`                                  |
-| CPU range  | 0xff00–0xffff | `ET_LOPROC`..`ET_HIPROC`                              |
-
-### `e_machine` (the common ones)
-
-| Name         | Value      |
-|--------------|------------|
-| `EM_386`     | 3          |
-| `EM_MIPS`    | 8          |
-| `EM_ARM`     | 40         |
-| `EM_X86_64`  | 62         |
-| `EM_AARCH64` | 183 (0xb7) |
-| `EM_RISCV`   | 243        |
-
----
-
-## Does the header change per architecture, word size, etc.?
-
-- **32 vs 64-bit:** there are two layouts. The fields are the same; only
-  `e_entry`, `e_phoff` and `e_shoff` grow from 4 to 8 bytes, which moves
-  every field after them.
-- **Endianness:** the layout stays the same; only how you decode integers
-  changes. That gives four real combinations: 32-LE, 32-BE, 64-LE, 64-BE.
-- **CPU:** there is no per-CPU header. The CPU is just the `e_machine` value.
-  What changes per CPU is the meaning of `e_flags` (ARM keeps its EABI version
-  there, RISC-V its float ABI, and so on), plus things deeper in the file
-  such as relocation types. Each architecture documents these in its own
-  "psABI supplement" to the gABI.
-- **OS:** just the `EI_OSABI` byte. Linux binaries often have 0 there.
-
-Don't infer the class from the machine. x32 is `ELFCLASS32` with
-`EM_X86_64`, and MIPS comes in both classes.
-
----
+```
+index  name       value          meaning
+-----  ---------  -------------  ----------------------------------------
+0..3   EI_MAG0-3  7f 45 4c 46    \x7f 'E' 'L' 'F' — reject if no match
+4      EI_CLASS   1 / 2          1 = ELFCLASS32, 2 = ELFCLASS64
+5      EI_DATA    1 / 2          1 = little-endian, 2 = big-endian
+6      EI_VERSION 1              must be 1
+7      EI_OSABI   0 / 3          0 = SysV, 3 = Linux (mostly ignored)
+8..15  padding    0              ignored
+```
 
 ## Parsing order
 
-1. Make sure the file is at least `EI_NIDENT` (16) bytes, then read `e_ident`.
-2. Check the magic.
-3. Pick the layout from `EI_CLASS` and the byte order from `EI_DATA`.
-4. Read the rest of the header with that layout and byte order.
-5. Validate before trusting any of it:
-   - `e_ehsize` matches the expected size for the class.
-   - `e_phentsize` / `e_shentsize` match the expected entry sizes (when the
-     table exists).
-   - `offset + count * entsize` fits inside the file. Check this without
-     overflowing: `count <= (size - offset) / entsize`.
+1. File at least 64 bytes? If not: truncated, bail.
+2. Magic bytes match? If not: not ELF, bail.
+3. `e_ident[4] == 2` (ELFCLASS64)? This tool only does 64-bit.
+4. `e_ident[5]`: if 2, the multi-byte fields above are big-endian and must
+   be byte-swapped (fields *inside* e_ident are raw bytes, no swap).
 
----
+## Hostile-file traps (all offsets above come from the file and lie)
 
-## Gotchas
+- `e_phoff + e_phnum * e_phentsize` must fit inside the file, or bail.
+- Same for `e_shoff + e_shnum * e_shentsize`.
+- Three escape hatches for tables that outgrow the 16-bit counts:
+  - `e_phnum == 0xffff` (PN_XNUM): real count is in `sh_info` of
+    section header 0 — which itself must be bounds-checked.
+  - `e_shnum == 0` **and** `e_shoff != 0`: real count is in `sh_size`
+    of section header 0.
+  - `e_shstrndx == 0xffff` (SHN_XINDEX): real index is in `sh_link`
+    of section header 0.
+- `e_shoff == 0` legitimately means "no section headers" (stripped
+  binary) — that's a normal path, not an error.
 
-- `e_shoff` can be 0, meaning the file has no section headers. A loader only
-  needs program headers, so a runnable binary may carry no section headers at all.
-- `e_shstrndx` can be `SHN_UNDEF` (0), meaning there are no section names.
-- **Extended numbering** (rare but legal). When the real value doesn't fit
-  in a `Half`, it lives in section header #0 instead:
+## How to find the entry point's bytes
 
-  | Header says                        | Real value is in      |
-  |------------------------------------|-----------------------|
-  | `e_phnum == PN_XNUM` (0xffff)      | `sh_info` of section 0 |
-  | `e_shnum == 0` and `e_shoff != 0`  | `sh_size` of section 0 |
-  | `e_shstrndx == SHN_XINDEX` (0xffff)| `sh_link` of section 0 |
-
-- Every offset and count in here came from the file. A hostile file lies.
-
----
-
-## Example: x86-64 PIE, 64-bit little-endian
-
-```
-00: 7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00
-10: 03 00 3e 00 01 00 00 00  50 10 00 00 00 00 00 00
-20: 40 00 00 00 00 00 00 00  a8 36 00 00 00 00 00 00
-30: 00 00 00 00 40 00 38 00  0d 00 40 00 1f 00 1e 00
-```
-
-| Bytes      | Field         | Value                                   |
-|------------|---------------|-----------------------------------------|
-| 0x00–0x03  | magic         | `\x7fELF`                               |
-| 0x04       | `EI_CLASS`    | 2 → 64-bit                              |
-| 0x05       | `EI_DATA`     | 1 → little-endian                       |
-| 0x06       | `EI_VERSION`  | 1                                       |
-| 0x07       | `EI_OSABI`    | 0 → System V                            |
-| 0x10       | `e_type`      | 3 → `ET_DYN` (PIE here)                 |
-| 0x12       | `e_machine`   | 0x3e = 62 → x86-64 (aarch64: `b7 00`)   |
-| 0x14       | `e_version`   | 1                                       |
-| 0x18       | `e_entry`     | 0x1050                                  |
-| 0x20       | `e_phoff`     | 0x40 → right after this header          |
-| 0x28       | `e_shoff`     | 0x36a8                                  |
-| 0x30       | `e_flags`     | 0                                       |
-| 0x34       | `e_ehsize`    | 64                                      |
-| 0x36       | `e_phentsize` | 56                                      |
-| 0x38       | `e_phnum`     | 13                                      |
-| 0x3a       | `e_shentsize` | 64                                      |
-| 0x3c       | `e_shnum`     | 31                                      |
-| 0x3e       | `e_shstrndx`  | 30                                      |
-
-To check against a real file on the VM: `xxd -l 64 ./binfmt` and `readelf -h ./binfmt`.
+`e_entry` is a **virtual address**, not a file offset. To get bytes:
+find the `PT_LOAD` segment where `p_vaddr <= e_entry < p_vaddr + p_filesz`,
+then file offset = `e_entry - p_vaddr + p_offset`. That arithmetic is why
+you need the program header table, not just this header.
